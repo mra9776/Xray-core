@@ -5,6 +5,7 @@ package inbound
 import (
 	"bytes"
 	"context"
+	gotls "crypto/tls"
 	"io"
 	"reflect"
 	"strconv"
@@ -151,6 +152,19 @@ func New(ctx context.Context, config *Config, dc dns.Client) (*Handler, error) {
 	}
 
 	return handler, nil
+}
+
+func isMuxAndNotXUDP(request *protocol.RequestHeader, first *buf.Buffer) bool {
+	if request.Command != protocol.RequestCommandMux {
+		return false
+	}
+	if first.Len() < 7 {
+		return true
+	}
+	firstBytes := first.Bytes()
+	return !(firstBytes[2] == 0 && // ID high
+		firstBytes[3] == 0 && // ID low
+		firstBytes[6] == 2) // Network type: UDP
 }
 
 // Close implements common.Closable.Close().
@@ -470,13 +484,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					var t reflect.Type
 					var p uintptr
 					if tlsConn, ok := iConn.(*tls.Conn); ok {
+						if tlsConn.ConnectionState().Version != gotls.VersionTLS13 {
+							return newError(`failed to use `+requestAddons.Flow+`, found outer tls version `, tlsConn.ConnectionState().Version).AtWarning()
+						}
 						netConn = tlsConn.NetConn()
 						if pc, ok := netConn.(*proxyproto.Conn); ok {
 							netConn = pc.Raw()
 							// 8192 > 4096, there is no need to process pc's bufReader
-						}
-						if sc, ok := netConn.(syscall.Conn); ok {
-							rawConn, _ = sc.SyscallConn()
 						}
 						t = reflect.TypeOf(tlsConn.Conn).Elem()
 						p = uintptr(unsafe.Pointer(tlsConn.Conn))
@@ -486,6 +500,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 						return newError(`failed to use ` + requestAddons.Flow + `, vision "security" must be "tls"`).AtWarning()
 					} else {
 						return newError("XTLS only supports TCP, mKCP and DomainSocket for now.").AtWarning()
+					}
+					if sc, ok := netConn.(syscall.Conn); ok {
+						rawConn, _ = sc.SyscallConn()
 					}
 					i, _ := t.FieldByName("input")
 					r, _ := t.FieldByName("rawInput")
@@ -509,7 +526,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			return newError(account.ID.String() + " is not able to use " + requestAddons.Flow).AtWarning()
 		}
 	case "", "none":
-		if accountFlow == vless.XRV && !allowNoneFlow && request.Command == protocol.RequestCommandTCP {
+		if accountFlow == vless.XRV && !allowNoneFlow && (request.Command == protocol.RequestCommandTCP || isMuxAndNotXUDP(request, first)) {
 			return newError(account.ID.String() + " is not able to use " + vless.XRV +
 				". Note the pure tls proxy has certain tls in tls characters. Append \",none\" in flow to suppress").AtWarning()
 		}
