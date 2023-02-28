@@ -22,13 +22,14 @@ import (
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/xudp"
-	core "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vless/encoding"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"github.com/xtls/xray-core/transport/internet/xtls"
@@ -164,8 +165,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					netConn = utlsConn.NetConn()
 					t = reflect.TypeOf(utlsConn.Conn).Elem()
 					p = uintptr(unsafe.Pointer(utlsConn.Conn))
+				} else if realityConn, ok := iConn.(*reality.UConn); ok {
+					netConn = realityConn.NetConn()
+					t = reflect.TypeOf(realityConn.Conn).Elem()
+					p = uintptr(unsafe.Pointer(realityConn.Conn))
 				} else if _, ok := iConn.(*xtls.Conn); ok {
-					return newError(`failed to use ` + requestAddons.Flow + `, vision "security" must be "tls"`).AtWarning()
+					return newError(`failed to use ` + requestAddons.Flow + `, vision "security" must be "tls" or "reality"`).AtWarning()
 				} else {
 					return newError("XTLS only supports TCP, mKCP and DomainSocket for now.").AtWarning()
 				}
@@ -238,10 +243,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			if err1 == nil {
 				if requestAddons.Flow == vless.XRV {
 					encoding.XtlsFilterTls(multiBuffer, &numberOfPacketToFilter, &enableXtls, &isTLS12orAbove, &isTLS, &cipher, &remainingServerHello, ctx)
-					if isTLS {
-						for i, b := range multiBuffer {
-							multiBuffer[i] = encoding.XtlsPadding(b, 0x00, &userUUID, ctx)
-						}
+					multiBuffer = encoding.ReshapeMultiBuffer(ctx, multiBuffer)
+					for i, b := range multiBuffer {
+						multiBuffer[i] = encoding.XtlsPadding(b, encoding.CommandPaddingContinue, &userUUID, isTLS, ctx)
 					}
 				}
 				if err := serverWriter.WriteMultiBuffer(multiBuffer); err != nil {
@@ -249,6 +253,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				}
 			} else if err1 != buf.ErrReadTimeout {
 				return err1
+			} else if requestAddons.Flow == vless.XRV {
+				mb := make(buf.MultiBuffer, 1)
+				mb[0] = encoding.XtlsPadding(nil, encoding.CommandPaddingContinue, &userUUID, true, ctx) // we do a long padding to hide vless header
+				newError("Insert padding with empty content to camouflage VLESS header ", mb.Len()).WriteToLog(session.ExportIDToError(ctx))
+				if err := serverWriter.WriteMultiBuffer(mb); err != nil {
+					return err
+				}
 			}
 		} else {
 			newError("Reader is not timeout reader, will send out vless header separately from first payload").AtDebug().WriteToLog(session.ExportIDToError(ctx))
@@ -273,7 +284,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			if statConn != nil {
 				counter = statConn.WriteCounter
 			}
-			err = encoding.XtlsWrite(clientReader, serverWriter, timer, netConn, counter, ctx, &userUUID, &numberOfPacketToFilter,
+			err = encoding.XtlsWrite(clientReader, serverWriter, timer, netConn, counter, ctx, &numberOfPacketToFilter,
 				&enableXtls, &isTLS12orAbove, &isTLS, &cipher, &remainingServerHello)
 		} else {
 			// from clientReader.ReadMultiBuffer to serverWriter.WriteMultiBufer

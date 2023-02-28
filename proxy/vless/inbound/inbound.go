@@ -26,7 +26,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
-	core "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
 	feature_inbound "github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/policy"
@@ -34,6 +34,7 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vless/encoding"
+	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"github.com/xtls/xray-core/transport/internet/xtls"
@@ -242,6 +243,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				newError("realAlpn = " + alpn).AtInfo().WriteToLog(sid)
 			} else if xtlsConn, ok := iConn.(*xtls.Conn); ok {
 				cs := xtlsConn.ConnectionState()
+				name = cs.ServerName
+				alpn = cs.NegotiatedProtocol
+				newError("realName = " + name).AtInfo().WriteToLog(sid)
+				newError("realAlpn = " + alpn).AtInfo().WriteToLog(sid)
+			} else if realityConn, ok := iConn.(*reality.Conn); ok {
+				cs := realityConn.ConnectionState()
 				name = cs.ServerName
 				alpn = cs.NegotiatedProtocol
 				newError("realName = " + name).AtInfo().WriteToLog(sid)
@@ -488,18 +495,22 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 							return newError(`failed to use `+requestAddons.Flow+`, found outer tls version `, tlsConn.ConnectionState().Version).AtWarning()
 						}
 						netConn = tlsConn.NetConn()
-						if pc, ok := netConn.(*proxyproto.Conn); ok {
-							netConn = pc.Raw()
-							// 8192 > 4096, there is no need to process pc's bufReader
-						}
 						t = reflect.TypeOf(tlsConn.Conn).Elem()
 						p = uintptr(unsafe.Pointer(tlsConn.Conn))
+					} else if realityConn, ok := iConn.(*reality.Conn); ok {
+						netConn = realityConn.NetConn()
+						t = reflect.TypeOf(realityConn.Conn).Elem()
+						p = uintptr(unsafe.Pointer(realityConn.Conn))
 					} else if _, ok := iConn.(*tls.UConn); ok {
 						return newError("XTLS only supports UTLS fingerprint for the outbound.").AtWarning()
 					} else if _, ok := iConn.(*xtls.Conn); ok {
-						return newError(`failed to use ` + requestAddons.Flow + `, vision "security" must be "tls"`).AtWarning()
+						return newError(`failed to use ` + requestAddons.Flow + `, vision "security" must be "tls" or "reality"`).AtWarning()
 					} else {
 						return newError("XTLS only supports TCP, mKCP and DomainSocket for now.").AtWarning()
+					}
+					if pc, ok := netConn.(*proxyproto.Conn); ok {
+						netConn = pc.Raw()
+						// 8192 > 4096, there is no need to process pc's bufReader
 					}
 					if sc, ok := netConn.(syscall.Conn); ok {
 						rawConn, _ = sc.SyscallConn()
@@ -613,11 +624,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		}
 		if requestAddons.Flow == vless.XRV {
 			encoding.XtlsFilterTls(multiBuffer, &numberOfPacketToFilter, &enableXtls, &isTLS12orAbove, &isTLS, &cipher, &remainingServerHello, ctx)
-			if isTLS {
-				multiBuffer = encoding.ReshapeMultiBuffer(ctx, multiBuffer)
-				for i, b := range multiBuffer {
-					multiBuffer[i] = encoding.XtlsPadding(b, 0x00, &userUUID, ctx)
-				}
+			multiBuffer = encoding.ReshapeMultiBuffer(ctx, multiBuffer)
+			for i, b := range multiBuffer {
+				multiBuffer[i] = encoding.XtlsPadding(b, encoding.CommandPaddingContinue, &userUUID, isTLS, ctx)
 			}
 		}
 		if err := clientWriter.WriteMultiBuffer(multiBuffer); err != nil {
@@ -634,7 +643,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			if statConn != nil {
 				counter = statConn.WriteCounter
 			}
-			err = encoding.XtlsWrite(serverReader, clientWriter, timer, netConn, counter, ctx, &userUUID, &numberOfPacketToFilter,
+			err = encoding.XtlsWrite(serverReader, clientWriter, timer, netConn, counter, ctx, &numberOfPacketToFilter,
 				&enableXtls, &isTLS12orAbove, &isTLS, &cipher, &remainingServerHello)
 		} else {
 			// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBufer
